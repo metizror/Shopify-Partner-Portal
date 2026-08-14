@@ -1,0 +1,40 @@
+# dependencies
+node_modules/
+
+# next.js
+.next/
+out/
+*.tsbuildinfo
+
+# env (secrets)
+.env
+
+.env.local
+.env*.local
+
+# logs
+*.log
+npm-debug.log*
+
+# os
+.DS_Store
+
+# legacy scratch files (kept out of repo)
+email_preview.html
+__pycache__/
+*.pyc
+store_tokens.json
+.cookies.json
+
+# legacy on-disk data folder — superseded by FileBlob in MySQL.
+# (kept gitignored so old developer copies don't leak; actual files now live in DB.)
+data/
+
+.CLAUDE.md
+logs/
+
+# local database dumps
+/backups/
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat

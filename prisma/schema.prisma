@@ -1,0 +1,757 @@
+// Prisma schema for the Shopify Dashboard backend.
+// Mirrors the legacy MongoDB collections in src/lib/mongodb.ts.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+}
+
+// One row per Shopify Partner API event we've observed (install / uninstall /
+// subscription-charge etc). `event_id` is a deterministic dedupe key.
+model Event {
+  id           Int      @id @default(autoincrement())
+  eventId      String   @unique @map("event_id") @db.VarChar(512)
+  type         String   @db.VarChar(64)
+  appId        String   @map("app_id") @db.VarChar(64)
+  appName      String   @map("app_name") @db.VarChar(255)
+  org          String   @db.VarChar(64)
+  storeName    String?  @map("store_name") @db.VarChar(255)
+  storeUrl     String?  @map("store_url") @db.VarChar(255)
+  occurredAt   DateTime @map("occurred_at")
+  reason       String?  @db.Text
+  description  String?  @db.Text
+  planName     String?  @map("plan_name") @db.VarChar(128)
+  planAmount   Float?   @map("plan_amount")
+  planCurrency String?  @map("plan_currency") @db.VarChar(8)
+  insertedAt   DateTime @default(now()) @map("inserted_at")
+
+  @@index([appId, type, occurredAt])
+  @@index([occurredAt])
+  @@index([storeUrl])
+  @@map("events")
+}
+
+// Generic key/value state. `value` holds whatever payload the legacy doc had,
+// minus its `_id`. e.g. id='notify' → { last_check }, id='cookie_expiry_alert'
+// → { last_alert_day }, id='shopid_map' → { map: {...} }.
+model State {
+  id        String   @id @db.VarChar(128)
+  value     Json
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("state")
+}
+
+model StoreEmail {
+  domain    String   @id @db.VarChar(255)
+  email     String   @db.VarChar(255)
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("store_emails")
+}
+
+model StoreCountry {
+  domain    String   @id @db.VarChar(255)
+  country   String?  @db.VarChar(128)
+  phone     String?  @db.VarChar(64)
+  status    Int?
+  error     String?  @db.VarChar(255)
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("store_countries")
+}
+
+// Mixed bag of partner-related blobs: cookie array (id='shopify_partner'),
+// shopid map (id='shopid_map'), per-key settings (id='setting:xxx').
+model PartnerCookie {
+  id        String   @id @db.VarChar(128)
+  value     Json
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("partner_cookies")
+}
+
+// Dashboard users with role-based access control.
+model User {
+  id          Int      @id @default(autoincrement())
+  email       String   @unique @db.VarChar(255)
+  password    String   @db.VarChar(255)
+  name        String   @db.VarChar(255)
+  // The whole permission model. Only 'admin' can log in; any other value leaves
+  // the row in place but dormant. The sections/can_add/can_edit/can_delete/
+  // can_sync/owner_filter/orgs columns that used to sit here were dropped in
+  // 20260812120000_drop_user_permission_columns — no API route ever read them.
+  role        String   @db.VarChar(32)
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@map("users")
+}
+
+// Internal developer hub projects.
+// Connected Shopify Partner organisations (managed from the Shopify Partners tab).
+model ShopifyPartner {
+  id        Int      @id @default(autoincrement())
+  partnerId String   @unique @map("partner_id") @db.VarChar(255)
+  orgName   String   @map("org_name") @db.VarChar(255)
+  apiToken  String   @map("api_token") @db.Text
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("shopify_partners")
+}
+
+// Apps discovered/synced per connected Shopify Partner organisation.
+model ShopifyApp {
+  id        Int      @id @default(autoincrement())
+  partnerId String   @map("partner_id") @db.VarChar(255)
+  appId     String   @map("app_id") @db.VarChar(255)
+  name      String   @db.VarChar(512)
+  handle    String?  @db.VarChar(512) // App Store slug, e.g. store-locator-by-metizsoft
+  icon      String?  @db.Text         // optional icon URL
+  source    String   @default("sync") @db.VarChar(16) // 'sync' | 'manual'
+  syncedAt  DateTime @default(now()) @map("synced_at")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([partnerId, appId])
+  @@index([partnerId])
+  @@map("shopify_apps")
+}
+
+// Stores ("users") that have installed a synced ShopifyApp. Folded from the
+// Partner API install/uninstall event history; persisted so the app detail
+// page can paginate server-side instead of re-fetching the API every page.
+model ShopifyAppUser {
+  id            Int       @id @default(autoincrement())
+  partnerId     String    @map("partner_id") @db.VarChar(255)
+  appId         String    @map("app_id") @db.VarChar(255)
+  domain        String    @db.VarChar(255)
+  name          String    @db.VarChar(255)
+  status        String    @db.VarChar(16) // 'installed' | 'uninstalled'
+  installedAt   DateTime? @map("installed_at")
+  uninstalledAt DateTime? @map("uninstalled_at")
+  uninstallReason      String? @map("uninstall_reason") @db.Text       // Shopify's categorized churn reason
+  uninstallDescription String? @map("uninstall_description") @db.Text  // merchant's free-text feedback
+  syncedAt      DateTime  @default(now()) @map("synced_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+
+  @@unique([appId, domain])
+  @@index([appId, status])
+  @@map("shopify_app_users")
+}
+
+// Live install/uninstall events received via the partner webhook
+// (/api/partner-webhook). Each row is one install or uninstall; counts power the
+// live badges on the Partners page and app detail page.
+model ShopifyAppEvent {
+  id          Int      @id @default(autoincrement())
+  eventKey    String   @unique @map("event_key") @db.VarChar(600) // dedupe retried deliveries
+  partnerId   String   @map("partner_id") @db.VarChar(255)
+  appId       String   @map("app_id") @db.VarChar(255)
+  type        String   @db.VarChar(16) // 'installed' | 'uninstalled'
+  storeDomain String?  @map("store_domain") @db.VarChar(255)
+  storeName   String?  @map("store_name") @db.VarChar(255)
+  occurredAt  DateTime @map("occurred_at")
+  createdAt   DateTime @default(now()) @map("created_at")
+  source      String   @default("unknown") @db.VarChar(16) // 'webhook' | 'poller' | 'seed' — how this event reached us
+
+  @@index([appId, type])
+  @@index([partnerId, type])
+  @@index([appId, storeDomain, type]) // per-store lookup — install-date fallback
+  @@map("shopify_app_events")
+}
+
+// ── Uninstall enrichment ────────────────────────────────────────────────────
+// Each of our apps exposes an admin `shop-lookup` endpoint that, given a store
+// domain, returns install/uninstall dates, plan and (where the app tracks it)
+// the last user who opened the app. The Partner API exposes none of that, so
+// this is the only source. One row per app; the store domain is supplied at
+// call time, never stored here.
+model AppDataEndpoint {
+  id         Int       @id @default(autoincrement())
+  appId      String    @unique @map("app_id") @db.VarChar(255)
+  url        String    @db.VarChar(1000) // no query string; the shop param is appended
+  authType   String    @default("header") @map("auth_type") @db.VarChar(16) // header | bearer | query | none
+  authHeader String?   @map("auth_header") @db.VarChar(64) // e.g. 'x-api-key' (authType='header')
+  authToken  String?   @map("auth_token") @db.Text // secret — never returned to the client
+  shopParam  String    @default("domain") @map("shop_param") @db.VarChar(64)
+  timeoutMs  Int       @default(8000) @map("timeout_ms")
+  enabled    Boolean   @default(true)
+  lastOkAt   DateTime? @map("last_ok_at")
+  lastError  String?   @map("last_error") @db.Text
+  createdAt  DateTime  @default(now()) @map("created_at")
+  updatedAt  DateTime  @updatedAt @map("updated_at")
+
+  @@map("app_data_endpoints")
+}
+
+// What the app's shop-lookup returned at the moment a store uninstalled, merged
+// with our own fallbacks. Captured at event-ingest time — NOT at email-send time
+// — because a Flow delay or schedule can push the send days later, by which
+// point the app may have purged the shop (GDPR shop/redact fires at 48h).
+// Flows read this; it is the source of the {{install_date}} etc. merge tags.
+model UninstallSnapshot {
+  id             Int       @id @default(autoincrement())
+  appId          String    @map("app_id") @db.VarChar(255)
+  domain         String    @db.VarChar(255)
+  uninstalledAt  DateTime  @map("uninstalled_at")
+  installedAt    DateTime? @map("installed_at")
+  durationDays   Int?      @map("duration_days")
+  durationText   String?   @map("duration_text") @db.VarChar(64)
+  planType       String?   @map("plan_type") @db.VarChar(128)
+  previousPlan   String?   @map("previous_plan") @db.VarChar(128)
+  lastUserEmail  String?   @map("last_user_email") @db.VarChar(320)
+  lastUserName   String?   @map("last_user_name") @db.VarChar(255)
+  lastUserType   String?   @map("last_user_type") @db.VarChar(64)
+  lastAccessedAt DateTime? @map("last_accessed_at")
+  contactEmail   String?   @map("contact_email") @db.VarChar(320)
+  contactName    String?   @map("contact_name") @db.VarChar(255)
+  appStatus      Int?      @map("app_status")
+  // Why they left, as Shopify collected it on the uninstall survey. `reason` is
+  // the picked option(s) ("Not using app now"); `reasonDetail` is the free-text
+  // box. Both come from OUR Partner event, never from the app's API — the app
+  // has no way of knowing what the merchant told Shopify on the way out. Often
+  // blank: the survey is optional and most merchants skip it.
+  uninstallReason String?  @map("uninstall_reason") @db.Text
+  reasonDetail    String?  @map("reason_detail") @db.Text
+  // provenance — pending | ok | stale | not_found | unauthorized | failed | no_endpoint
+  fetchStatus    String    @default("pending") @map("fetch_status") @db.VarChar(16)
+  fetchError     String?   @map("fetch_error") @db.Text
+  attempts       Int       @default(0)
+  fetchedAt      DateTime? @map("fetched_at")
+  raw            Json? // the app's full response, for debugging
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  @@unique([appId, domain])
+  @@index([fetchStatus, attempts])
+  @@map("uninstall_snapshots")
+}
+
+// One row per Shopify Partner API financial transaction (subscription / usage /
+// one-time sale, credit, adjustment). This is the revenue source for the Home
+// dashboard (MRR, ARPU, gross/net earnings) — the legacy `Event` table only
+// captured a charge amount for a handful of rows. `tx_id` (the Partner
+// transaction GID tail) is the dedupe key. Populated by services/analytics-sync.ts.
+model Charge {
+  id              Int      @id @default(autoincrement())
+  txId            String   @unique @map("tx_id") @db.VarChar(255)
+  kind            String   @db.VarChar(24) // subscription | usage | one_time | credit | adjustment
+  partnerId       String   @map("partner_id") @db.VarChar(255)
+  appId           String   @map("app_id") @db.VarChar(255)
+  shopDomain      String?  @map("shop_domain") @db.VarChar(255)
+  shopName        String?  @map("shop_name") @db.VarChar(255)
+  chargeId        String?  @map("charge_id") @db.VarChar(255) // AppSubscription gid — groups recurring charges of one subscription
+  billingInterval String?  @map("billing_interval") @db.VarChar(32) // EVERY_30_DAYS | ANNUAL
+  net             Float    // partner's net payout for this line
+  gross           Float    // amount the merchant was charged
+  fee             Float    @default(0) // Shopify's cut
+  currency        String   @db.VarChar(8)
+  occurredAt      DateTime @map("occurred_at")
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  @@index([appId, occurredAt])
+  @@index([occurredAt])
+  @@index([shopDomain])
+  @@map("charges")
+}
+
+// ── CRM (Customers module) ──────────────────────────────────────────────────
+// A "customer" is a Shopify store, keyed by its myshopify domain (a store may
+// have installed several of our apps). The projected columns (name, status,
+// appIds, ltv, mrr, country, email, firstSeen, lastSeen, plan) are refreshed by
+// services/customer-sync.ts from ShopifyAppUser + Charge + StoreCountry/Email.
+// The CRM columns (tags, notes, accountOwner) are user-owned and are NEVER
+// overwritten by the sync.
+model Customer {
+  id           Int       @id @default(autoincrement())
+  domain       String    @unique @db.VarChar(255)
+  name         String    @db.VarChar(255)
+  status       String    @db.VarChar(16) // installed | uninstalled
+  country      String?   @db.VarChar(128)
+  email        String?   @db.VarChar(255)
+  plan         String?   @db.VarChar(128)
+  appIds       Json? // string[] of appIds this store has installed
+  ltv          Float     @default(0) // lifetime gross across all charges
+  mrr          Float     @default(0) // current monthly recurring revenue
+  firstSeen    DateTime? @map("first_seen")
+  lastSeen     DateTime? @map("last_seen")
+  syncedAt     DateTime  @default(now()) @map("synced_at")
+  // user-owned CRM fields (untouched by the sync)
+  tags         Json? // string[]
+  notes        String?   @db.Text
+  accountOwner String?   @map("account_owner") @db.VarChar(255)
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  @@index([status])
+  @@index([mrr])
+  @@map("customers")
+}
+
+// People associated with a customer store.
+model Contact {
+  id        Int      @id @default(autoincrement())
+  domain    String   @db.VarChar(255)
+  name      String   @db.VarChar(255)
+  email     String?  @db.VarChar(255)
+  role      String?  @db.VarChar(128)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([domain])
+  @@map("customer_contacts")
+}
+
+// Custom field definitions (schema) for the CRM.
+model CustomFieldDef {
+  id        Int      @id @default(autoincrement())
+  key       String   @unique @db.VarChar(64)
+  label     String   @db.VarChar(128)
+  type      String   @default("text") @db.VarChar(24) // text | number | date | boolean
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("custom_field_defs")
+}
+
+// Per-customer values for the custom fields above.
+model CustomFieldValue {
+  id        Int      @id @default(autoincrement())
+  domain    String   @db.VarChar(255)
+  fieldKey  String   @map("field_key") @db.VarChar(64)
+  value     String?  @db.Text
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([domain, fieldKey])
+  @@index([domain])
+  @@map("custom_field_values")
+}
+
+// Manual notes posted to a customer's activity timeline (auto events come from
+// the Event table, keyed by store domain).
+model TimelineComment {
+  id        Int      @id @default(autoincrement())
+  domain    String   @db.VarChar(255)
+  body      String   @db.Text
+  author    String?  @db.VarChar(255)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([domain])
+  @@map("customer_timeline_comments")
+}
+
+// Saved customer filters ("segments").
+model Segment {
+  id        Int      @id @default(autoincrement())
+  name      String   @db.VarChar(128)
+  filter    Json // { status?, appId?, tag?, country?, minMrr?, search? }
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("customer_segments")
+}
+
+// ── Flows (automation) ──────────────────────────────────────────────────────
+// A no-code automation: a trigger (install/uninstall/subscription event) scoped
+// to an app, followed by an ordered list of condition/action steps. `steps` is
+// a JSON array: [{ id, kind: 'condition'|'action', type, config }].
+model Flow {
+  id        Int      @id @default(autoincrement())
+  name      String   @db.VarChar(255)
+  slug      String?  @unique @db.VarChar(160) // human-readable URL handle
+  trigger   String   @db.VarChar(64) // customer_installs | customer_reinstalls | customer_uninstalls | subscription_activated | subscription_cancelled
+  appScope  String   @default("all") @map("app_scope") @db.VarChar(64) // 'all' or an appId
+  active    Boolean  @default(true)
+  steps     Json // [{ id, kind, type, config }]
+  layout    Json? // { trigger: {x,y}, steps: { [id]: {x,y} } } — builder canvas positions
+  schedule  Json? // inline schedule for the 'scheduled' trigger (when not using a named one): { freq, hour, minute, weekday }
+  scheduleId Int? @map("schedule_id") // reusable named schedule (FlowSchedule); takes precedence over inline `schedule`
+  nextRunAt DateTime? @map("next_run_at") // when a scheduled flow is next due
+  lastEventAt DateTime? @map("last_event_at") // newest trigger event this flow has processed (for "Run now")
+  createdBy String?  @map("created_by") @db.VarChar(255)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([trigger, active])
+  @@map("flows")
+}
+
+// One execution of a flow (for the Overview KPIs: total runs, success rate).
+model FlowRun {
+  id      Int      @id @default(autoincrement())
+  flowId  Int      @map("flow_id")
+  trigger String   @db.VarChar(64)
+  appId   String?  @map("app_id") @db.VarChar(64)
+  domain  String?  @db.VarChar(255)
+  status  String   @db.VarChar(16) // success | failed | skipped
+  log     Json? // per-step log
+  ranAt   DateTime @default(now()) @map("ran_at")
+
+  @@index([flowId])
+  @@index([ranAt])
+  @@map("flow_runs")
+}
+
+// A delayed action awaiting execution (the "Delay" on a Send email etc). Drained
+// by the poll cron once run_at passes.
+model FlowTask {
+  id        Int      @id @default(autoincrement())
+  flowId    Int      @map("flow_id")
+  runId     Int?     @map("run_id")
+  domain    String?  @db.VarChar(255)
+  appId     String?  @map("app_id") @db.VarChar(64)
+  action    Json // { type, config }
+  runAt     DateTime @map("run_at")
+  status    String   @default("pending") @db.VarChar(16) // pending | done | failed
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([status, runAt])
+  @@map("flow_tasks")
+}
+
+// A reusable, named schedule that scheduled flows can share.
+model FlowSchedule {
+  id        Int      @id @default(autoincrement())
+  name      String   @db.VarChar(128)
+  freq      String   @default("daily") @db.VarChar(16) // hourly | daily | weekly
+  hour      Int      @default(9)
+  minute    Int      @default(0)
+  weekday   Int      @default(1) // 0=Sun … 6=Sat (weekly only)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("flow_schedules")
+}
+
+// Output of the "Create task" flow action (a lightweight internal to-do).
+model Task {
+  id        Int       @id @default(autoincrement())
+  title     String    @db.VarChar(512)
+  domain    String?   @db.VarChar(255)
+  assignee  String?   @db.VarChar(255)
+  status    String    @default("open") @db.VarChar(16) // open | done
+  source    String?   @db.VarChar(32) // 'flow' | 'manual'
+  dueAt     DateTime? @map("due_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  @@index([status])
+  @@map("tasks")
+}
+
+// ── Email (builder) ─────────────────────────────────────────────────────────
+// Reusable header/footer wrapper applied around an email template's body.
+model EmailLayout {
+  id         Int      @id @default(autoincrement())
+  name       String   @db.VarChar(128)
+  headerHtml String   @map("header_html") @db.Text
+  footerHtml String   @map("footer_html") @db.Text
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  @@map("email_layouts")
+}
+
+// An email body + subject (with {{merge}} variables) that the Flow "Send email"
+// action can reference. Optionally wrapped in a layout.
+model EmailTemplate {
+  id        Int      @id @default(autoincrement())
+  name      String   @db.VarChar(128)
+  subject   String   @db.VarChar(255)
+  bodyHtml  String   @map("body_html") @db.Text
+  layoutId  Int?     @map("layout_id")
+  category  String   @default("transactional") @db.VarChar(32)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("email_templates")
+}
+
+// A from-address used when sending. Must be a sender Brevo has verified.
+model EmailSender {
+  id        Int      @id @default(autoincrement())
+  email     String   @unique @db.VarChar(255)
+  name      String   @db.VarChar(128)
+  isDefault Boolean  @default(false) @map("is_default")
+  verified  Boolean  @default(false)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("email_senders")
+}
+
+// How this installation actually delivers mail. Singleton — always id = 1.
+//
+// Credentials used to live only in BREVO_API_KEY, which meant configuring email
+// required shell access to edit .env and restart the process. They are stored
+// here so the whole setup is doable from Settings → Email, and .env is still
+// read as a fallback so existing deploys keep working untouched.
+//
+// Both providers' credentials persist; `provider` alone decides which one is
+// live, so switching back after a test doesn't mean retyping anything. Nothing
+// in this table is ever serialized to the browser in full — the API masks
+// brevoApiKey and smtpPassword to their last 4 characters (lib/user-profile.ts
+// does the same job for User.password).
+model EmailConfig {
+  id       Int    @id @default(1)
+  provider String @default("brevo") @db.VarChar(16) // 'brevo' | 'smtp'
+
+  brevoApiKey String? @map("brevo_api_key") @db.VarChar(255)
+
+  smtpHost     String? @map("smtp_host") @db.VarChar(255)
+  smtpPort     Int?    @map("smtp_port")
+  smtpUser     String? @map("smtp_user") @db.VarChar(255)
+  smtpPassword String? @map("smtp_password") @db.VarChar(255)
+  // STARTTLS on 587 vs implicit TLS on 465. Wrong choice looks like a hang,
+  // not an auth error, so it is an explicit switch rather than inferred.
+  smtpSecure Boolean @default(false) @map("smtp_secure")
+
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("email_config")
+}
+
+// ── Campaigns (bulk email from an imported sheet) ───────────────────────────
+// A campaign imported from an Excel/CSV sheet on the Shopify → Campaign page.
+// Rows become CampaignRecipient records; a chosen EmailTemplate is rendered
+// per-recipient (with sheet columns mapped to merge tags) and sent via Brevo,
+// drained in batches by the poll-events cron.
+model Campaign {
+  id          Int       @id @default(autoincrement())
+  name        String    @db.VarChar(255)
+  fileName    String    @map("file_name") @db.VarChar(255)
+  sheetName   String?   @map("sheet_name") @db.VarChar(255)
+  headers     Json // string[] — column names from the sheet
+  emailColumn String?   @map("email_column") @db.VarChar(255) // header that holds the address
+  subject     String?   @db.VarChar(255) // per-campaign subject (overrides the template's), supports {{merge}}
+  templateId  Int?      @map("template_id")
+  senderId    Int?      @map("sender_id")
+  varMap      Json?     @map("var_map") // { mergeTag: columnName } for personalization
+  status      String    @default("draft") @db.VarChar(16) // draft | sending | sent | scheduled | paused | cancelled
+  scheduledAt DateTime? @map("scheduled_at") // null = send now; set = release time (UTC)
+  totalCount  Int       @default(0) @map("total_count")
+  sentCount   Int       @default(0) @map("sent_count")
+  failedCount Int       @default(0) @map("failed_count")
+  createdBy   String?   @map("created_by") @db.VarChar(255)
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  @@index([status])
+  @@map("campaigns")
+}
+
+// One row of a campaign's sheet: an address plus the full row (keyed by header)
+// for merge-tag personalization. `status` drives the batched send drainer.
+model CampaignRecipient {
+  id         Int       @id @default(autoincrement())
+  campaignId Int       @map("campaign_id")
+  email      String    @db.VarChar(320)
+  vars       Json // { [header]: cellValue } — the whole row
+  selected   Boolean   @default(false) // part of the current send?
+  status     String    @default("pending") @db.VarChar(16) // pending | queued | sending | sent | failed | skipped
+  sendAt     DateTime? @map("send_at") // per-recipient release time (drives batching)
+  sentAt     DateTime? @map("sent_at")
+  error      String?   @db.Text
+  messageId  String?   @map("message_id") @db.VarChar(255)
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  @@unique([campaignId, email])
+  @@index([campaignId, status])
+  @@index([status, sendAt])
+  @@map("campaign_recipients")
+}
+
+// ── Campaign Sequences (batched drip: fresh → follow-up 1 → follow-up 2) ────
+// A running "process" over an imported sheet: contacts are split into batches
+// of `batchSize`; every `gapDays` at `sendHour` IST a cycle runs — the next
+// batch gets the fresh email, the previous batch gets follow-up 1 (only those
+// who haven't opened/replied), the one before that gets follow-up 2. After
+// follow-up 2 a contact never gets another email.
+model CampaignSequence {
+  id              Int       @id @default(autoincrement())
+  campaignId      Int?      @map("campaign_id") // source sheet campaign; null when the audience is merchants
+  // Where the contacts come from. Null on sequences created before merchant
+  // audiences existed — treat a null as { source: 'sheet' }.
+  //   { source: 'sheet' }      — batched drip over an imported campaign sheet
+  //   { source: 'merchants', trigger: 'install' | 'uninstall' | 'both', appId?: string }
+  // A merchant sequence is event-triggered, not batched: a store is enrolled
+  // the moment it installs/uninstalls and gets the fresh email straight away,
+  // then fu1 after fu1Days and fu2 fu2Days later. It has no batches or cycles
+  // and never completes on its own — it runs until paused.
+  audience        Json?
+  name            String    @db.VarChar(255)
+  batchSize       Int       @map("batch_size")
+  gapDays         Int       @map("gap_days")
+  sendHour        Int       @map("send_hour") // 0-23, IST — cycles fire at this hour
+  // Triggered (merchant) sequences only: days from the fresh email to follow-up
+  // 1, and from follow-up 1 to follow-up 2. Batched sheet sequences pace
+  // themselves with gapDays instead and ignore these.
+  fu1Days         Int       @default(2) @map("fu1_days")
+  fu2Days         Int       @default(3) @map("fu2_days")
+  freshTemplateId Int       @map("fresh_template_id")
+  freshSubject    String    @map("fresh_subject") @db.VarChar(255)
+  fu1TemplateId   Int       @map("fu1_template_id")
+  fu1Subject      String    @map("fu1_subject") @db.VarChar(255)
+  fu2TemplateId   Int       @map("fu2_template_id")
+  fu2Subject      String    @map("fu2_subject") @db.VarChar(255)
+  senderId        Int?      @map("sender_id")
+  varMap          Json?     @map("var_map") // { mergeTag: columnName }
+  status          String    @default("running") @db.VarChar(16) // running | paused | completed | cancelled
+  currentCycle    Int       @default(0) @map("current_cycle") // cycles completed so far
+  totalBatches    Int       @map("total_batches")
+  nextRunAt       DateTime? @map("next_run_at")
+  activity        Json? // [{at, cycle, fresh, fu1, fu1Skipped, fu2, fu2Skipped}] — admin timeline
+  createdBy       String?   @map("created_by") @db.VarChar(255)
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  contacts SequenceContact[]
+
+  @@index([status, nextRunAt])
+  @@map("campaign_sequences")
+}
+
+// One person in a sequence. `stage` tracks their journey (max 3 emails);
+// any non-'none' `engaged` value stops all further follow-ups to them. It is set
+// by the tracking pixel, the Brevo webhook, the Zoho reply poller, or an admin mark.
+model SequenceContact {
+  id         Int              @id @default(autoincrement())
+  sequenceId Int              @map("sequence_id")
+  sequence   CampaignSequence @relation(fields: [sequenceId], references: [id])
+  email      String           @db.VarChar(320)
+  vars       Json // { [header]: cellValue } — the sheet row, or the merchant's fields
+  batchNo    Int              @default(0) @map("batch_no") // 1-based batch index; 0 on triggered contacts, which have no batch
+  // Triggered sequences only: when this contact's next follow-up is due. Each
+  // contact runs its own clock from its enrolment, so two stores that installed
+  // an hour apart follow up an hour apart. Null = nothing further scheduled.
+  nextDueAt  DateTime?        @map("next_due_at")
+  stage      String           @default("waiting") @db.VarChar(16) // waiting | fresh_sent | fu1_sent | fu2_sent | finished
+  engaged    String           @default("none") @db.VarChar(16) // none | opened | replied | unsubscribed | bounced
+  openToken  String           @unique @map("open_token") @db.VarChar(64) // tracking-pixel token
+  openedAt   DateTime?        @map("opened_at")
+  repliedAt  DateTime?        @map("replied_at")
+  lastSentAt DateTime?        @map("last_sent_at")
+  error      String?          @db.Text
+  createdAt  DateTime         @default(now()) @map("created_at")
+  updatedAt  DateTime         @updatedAt @map("updated_at")
+
+  emails SequenceEmail[]
+
+  @@unique([sequenceId, email])
+  @@index([sequenceId, batchNo])
+  @@index([sequenceId, stage])
+  @@index([nextDueAt])
+  @@map("sequence_contacts")
+}
+
+// One actual email in a sequence (fresh/fu1/fu2 per contact). The queue the
+// cron drainer works through — mirrors CampaignRecipient's status machine.
+model SequenceEmail {
+  id         Int             @id @default(autoincrement())
+  sequenceId Int             @map("sequence_id")
+  contactId  Int             @map("contact_id")
+  contact    SequenceContact @relation(fields: [contactId], references: [id])
+  kind       String          @db.VarChar(8) // fresh | fu1 | fu2
+  status     String          @default("queued") @db.VarChar(16) // queued | sending | sent | failed | skipped
+  sendAt     DateTime        @map("send_at")
+  sentAt     DateTime?       @map("sent_at")
+  messageId  String?         @map("message_id") @db.VarChar(255)
+  error      String?         @db.Text
+  createdAt  DateTime        @default(now()) @map("created_at")
+
+  @@index([status, sendAt])
+  @@index([sequenceId, kind])
+  @@map("sequence_emails")
+}
+
+// ── Affiliates (referral management) ────────────────────────────────────────
+// A commission program affiliates are enrolled in.
+model AffiliateProgram {
+  id              Int      @id @default(autoincrement())
+  name            String   @db.VarChar(255)
+  description     String?  @db.Text
+  commissionType  String   @default("percentage") @map("commission_type") @db.VarChar(16) // percentage | fixed
+  commissionValue Float    @default(0) @map("commission_value")
+  cookieDays      Int      @default(30) @map("cookie_days")
+  status          String   @default("active") @db.VarChar(16) // active | paused
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  @@map("affiliate_programs")
+}
+
+// A partner who refers customers using their unique code.
+model Affiliate {
+  id        Int      @id @default(autoincrement())
+  name      String   @db.VarChar(255)
+  email     String   @db.VarChar(255)
+  code      String   @unique @db.VarChar(64)
+  programId Int?     @map("program_id")
+  status    String   @default("active") @db.VarChar(16) // active | pending | suspended
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([programId])
+  @@map("affiliates")
+}
+
+// A conversion attributed to an affiliate; commission is derived from its program.
+model Referral {
+  id             Int      @id @default(autoincrement())
+  affiliateId    Int      @map("affiliate_id")
+  customerName   String?  @map("customer_name") @db.VarChar(255)
+  customerDomain String?  @map("customer_domain") @db.VarChar(255)
+  saleAmount     Float    @default(0) @map("sale_amount")
+  commission     Float    @default(0)
+  status         String   @default("pending") @db.VarChar(16) // pending | approved | rejected
+  occurredAt     DateTime @default(now()) @map("occurred_at")
+
+  @@index([affiliateId])
+  @@map("affiliate_referrals")
+}
+
+// A payment made to an affiliate against their accrued commissions.
+model AffiliatePayout {
+  id          Int       @id @default(autoincrement())
+  affiliateId Int       @map("affiliate_id")
+  amount      Float
+  method      String?   @db.VarChar(64)
+  status      String    @default("pending") @db.VarChar(16) // pending | paid
+  note        String?   @db.Text
+  paidAt      DateTime? @map("paid_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  @@index([affiliateId])
+  @@map("affiliate_payouts")
+}
+
+// An affiliate's request/dispute for credit.
+model AffiliateClaim {
+  id          Int      @id @default(autoincrement())
+  affiliateId Int      @map("affiliate_id")
+  amount      Float    @default(0)
+  reason      String   @db.Text
+  status      String   @default("open") @db.VarChar(16) // open | approved | rejected
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@index([affiliateId])
+  @@map("affiliate_claims")
+}
+
+// Misc file blobs still needed for data.json snapshot and app_ads_column_order.json.
+// Partner-managed stores scraped from the Partner Dashboard.
+model PartnerManagedStore {
+  id        Int      @id @default(autoincrement())
+  orgId     String   @map("org_id") @db.VarChar(32)
+  shopId    String?  @map("shop_id") @db.VarChar(64)
+  name      String   @db.VarChar(255)
+  domain    String   @unique @db.VarChar(255)
+  url       String   @db.VarChar(512)
+  plan      String?  @db.VarChar(128)
+  access    String?  @db.VarChar(32)
+  state     String?  @db.VarChar(32)
+  started   String?  @db.VarChar(32)
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("partner_managed_stores")
+}
